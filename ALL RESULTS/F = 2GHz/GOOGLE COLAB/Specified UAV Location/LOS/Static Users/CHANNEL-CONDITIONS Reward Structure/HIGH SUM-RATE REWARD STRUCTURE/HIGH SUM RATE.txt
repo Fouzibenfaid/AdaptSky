@@ -1,0 +1,1053 @@
+%matplotlib inline
+import gym
+import math
+import random
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import math
+from collections import namedtuple
+from itertools import count
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torchvision.transforms as T
+import cv2
+import time
+from ipywidgets.widgets.interaction import show_inline_matplotlib_plots
+from IPython.display import clear_output
+
+is_ipython = 'inline' in matplotlib.get_backend()
+if is_ipython: from IPython import display
+
+torch.manual_seed(0)
+np.random.seed(0)
+
+class DQN(nn.Module):
+    def __init__(self, NUMBER_OF_ARGUMENTS_PER_STATE):
+        super().__init__(),
+
+        self.fc1 = nn.Linear(in_features=NUMBER_OF_ARGUMENTS_PER_STATE, out_features=128)
+        self.fc2 = nn.Linear(in_features=128, out_features=128)        
+        self.out_v = nn.Linear(in_features=128, out_features=1)
+        self.out_a = nn.Linear(in_features=128, out_features=32)
+
+    def forward(self, t):
+        t = t.flatten(start_dim=1)
+        t = F.relu(self.fc1(t))
+        t = F.relu(self.fc2(t))
+        v = self.out_v(t) #Value Stream
+        a = self.out_a(t) # Advantage Stream
+        q = v + a - a.mean()
+        return q
+
+
+Experience = namedtuple(
+            'Experience',
+            ('state', 'action', 'next_state', 'reward')
+                        )
+
+class ReplayMemory():
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.memory = []
+        self.push_count = 0
+
+    def push(self, experience):
+        if len(self.memory) < self.capacity:
+            self.memory.append(experience)
+        else:
+            self.memory[self.push_count % self.capacity] = experience
+        self.push_count += 1
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+
+    def can_provide_sample(self, batch_size):
+        return len(self.memory) >= batch_size
+
+class EpsilonGreedyStrategy():
+
+    def __init__(self, start, end, decay):
+        self.start = start
+        self.end = end
+        self.decay = decay
+
+    def get_exploration_rate(self, current_step):
+        return self.end + (self.start - self.end) * \
+                            math.exp(-1. * current_step * self.decay)
+
+class Agent():
+    def __init__(self, strategy, num_actions, device):
+
+        self.current_step = 0
+        self.strategy = strategy
+        self.num_actions = num_actions
+        self.device = device
+
+    def select_action(self, state, policy_net):
+        rate = self.strategy.get_exploration_rate(self.current_step)
+        self.current_step += 1
+
+        if rate > random.random():
+            action = random.randrange(self.num_actions)
+            return torch.tensor([action]).to(self.device) # explore    
+        else:
+            with torch.no_grad():
+                return policy_net(state).argmax(dim=1).to(self.device) # exploit
+
+class QValues():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    @staticmethod
+    def get_current(policy_net, states, actions):
+        return policy_net(states).gather(dim=1, index=actions.unsqueeze(-1))
+    @staticmethod        
+    def get_next(target_net, next_states):                 
+        return target_net(next_states).max(dim=1)[0].detach()
+
+def plot(values,r1,r2,r3,r4,r5,r6,h1,h2,h3,h4,a1,a2,a3,a4,SUM1,SUM2,SUM3,SUM4,Fairness,AVG2, Fairness2, H, moving_avg_period):
+    plt.figure(2)
+    plt.clf()
+    plt.rcParams['figure.figsize'] = (20,50)
+    
+    fig = plt.figure()
+    
+    plt.subplot(5, 2, 1)
+    plt.xlabel('Episode')
+    plt.ylabel('Rewards')
+    plt.plot(values, "-", label="Instantaneous Rewards")
+    moving_avg_reward1 = get_moving_average(moving_avg_period, r1)
+    moving_avg_reward2 = get_moving_average(moving_avg_period, r2)
+    moving_avg_reward3 = get_moving_average(moving_avg_period, r3)
+    moving_avg_reward4 = get_moving_average(moving_avg_period, r4)
+    moving_avg_reward5 = get_moving_average(moving_avg_period, r5)
+    moving_avg_reward6 = get_moving_average(moving_avg_period, r6)
+    moving_avg_rewards = get_moving_average(moving_avg_period, values)
+    plt.plot(moving_avg_rewards, "--", label="Total Rewards Moving Average")
+    plt.plot(moving_avg_reward1, "--", label="Reward_1 Moving Average")
+    plt.plot(moving_avg_reward2, "--", label="Reward_2 Moving Average")
+    plt.plot(moving_avg_reward3, "--", label="Reward_3 Moving Average")
+    plt.plot(moving_avg_reward4, "--", label="Reward_4 Moving Average")
+    plt.plot(moving_avg_reward5, "--", label="Reward_5 Moving Average")
+    plt.plot(moving_avg_reward6, "--", label="Reward_6 Moving Average")
+    plt.legend(loc="upper left")
+    plt.grid()
+    
+    plt.subplot(5, 2, 2)
+    plt.xlabel('Episode')
+    plt.ylabel('Fairness')
+    Fairness = [element * 100 for element in Fairness]
+    moving_avg_fairness = get_moving_average(moving_avg_period, Fairness)
+    Fairness2 = [element * 100 for element in Fairness2]
+    moving_avg_fairness2 = get_moving_average(moving_avg_period, Fairness2)
+    plt.plot(moving_avg_fairness, "--", label = "UAV-1 Fairness Moving Average")
+    plt.plot(moving_avg_fairness2, "-", label = "UAV-2 Fairness Moving Average")
+    plt.legend(loc="upper left")
+    plt.grid()
+
+    plt.subplot(5, 2, 3)
+    plt.xlabel('Episode')
+    plt.ylabel('Channel Conditions')
+    moving_avg_h1 = get_moving_average(moving_avg_period, h1)
+    moving_avg_h2 = get_moving_average(moving_avg_period, h2)
+    plt.plot(moving_avg_h1,"b-", label="USER1")
+    plt.plot(moving_avg_h2, "g--", label="USER2")
+    plt.legend(loc="upper left")
+    plt.grid()
+    
+    plt.subplot(5, 2, 4)
+    plt.xlabel('Episode')
+    plt.ylabel('Channel Conditions')
+    moving_avg_h3 = get_moving_average(moving_avg_period, h3)
+    moving_avg_h4 = get_moving_average(moving_avg_period, h4)
+    plt.plot(moving_avg_h3, "y-", label="USER3")
+    plt.plot(moving_avg_h4, "r--", label="USER4")
+    plt.legend(loc="upper left")
+    plt.grid()
+
+    plt.subplot(5, 2, 5)
+    plt.xlabel('Episode')
+    plt.ylabel('Power percentage %')
+    moving_avg_a1 = get_moving_average(moving_avg_period, a1)
+    moving_avg_a2 = get_moving_average(moving_avg_period, a2)
+    moving_avg_a1 = [element * 100 for element in moving_avg_a1]
+    moving_avg_a2 = [element * 100 for element in moving_avg_a2]
+    plt.plot(moving_avg_a1, "b-", label="USER1")
+    plt.plot(moving_avg_a2, "g--", label="USER2")
+    plt.legend(loc="upper left")
+    plt.grid()
+
+    plt.subplot(5, 2, 6)
+    plt.xlabel('Episode')
+    plt.ylabel('Power percentage %')
+    moving_avg_a3 = get_moving_average(moving_avg_period, a3)
+    moving_avg_a4 = get_moving_average(moving_avg_period, a4)
+    moving_avg_a3 = [element * 100 for element in moving_avg_a3]
+    moving_avg_a4 = [element * 100 for element in moving_avg_a4]
+    plt.plot(moving_avg_a3, "y-", label="USER3")
+    plt.plot(moving_avg_a4, "r--", label="USER4")
+    plt.legend(loc="upper left")
+    plt.grid()
+    
+    plt.subplot(5, 2, 7)
+    plt.xlabel('Episode')
+    plt.ylabel('SUM Rate (Mbps)')
+    moving_avg_SUM1 = get_moving_average(moving_avg_period, SUM1)
+    moving_avg_SUM2 = get_moving_average(moving_avg_period, SUM2)
+    moving_avg_SUM1 = [element * 50 for element in moving_avg_SUM1]
+    moving_avg_SUM2 = [element * 50 for element in moving_avg_SUM2]
+    plt.plot(moving_avg_SUM1, "b-", label="USER1")
+    plt.plot(moving_avg_SUM2, "g--", label="USER2")
+    plt.legend(loc="upper left")
+    plt.grid()
+    
+    plt.subplot(5, 2, 8)
+    plt.xlabel('Episode')
+    plt.ylabel('SUM Rate (Mbps)')
+    moving_avg_SUM3 = get_moving_average(moving_avg_period, SUM3)
+    moving_avg_SUM4 = get_moving_average(moving_avg_period, SUM4)
+    moving_avg_SUM3 = [element * 50 for element in moving_avg_SUM3]
+    moving_avg_SUM4 = [element * 50 for element in moving_avg_SUM4]
+    plt.plot(moving_avg_SUM3, "y-", label="USER3")
+    plt.plot(moving_avg_SUM4, "r--", label="USER4")
+    plt.legend(loc="upper left")
+    plt.grid()
+    
+    plt.subplot(5, 2, 9)
+    plt.xlabel('Episode')
+    plt.ylabel('SUM Rate (Mbps)')
+    SUM = np.add(moving_avg_SUM1,moving_avg_SUM2)
+    SUM = np.add(SUM,moving_avg_SUM3)
+    SUM = np.add(SUM,moving_avg_SUM4)
+    plt.plot(SUM, "b-", label="Total Sum Rate")
+    avg2 = get_moving_average(moving_avg_period, AVG2)
+    avg2 = [element * 50 for element in avg2]
+    plt.plot(avg2, "r--", label="UAV2 Total Sum Rate")
+    plt.legend(loc="upper left")
+    plt.grid()
+    
+    plt.subplot(5, 2, 10)
+    plt.xlabel('Episode')
+    plt.ylabel('UAV Height')
+    moving_avg_Height = get_moving_average(moving_avg_period, H)
+    plt.plot(moving_avg_Height, label = "UAV Height Moving Average")
+    plt.legend(loc="upper left")
+    plt.grid()
+    
+    plt.show()
+
+    print("Episode", len(values))
+    print(moving_avg_period, "Episode moving avg:", moving_avg_rewards[-1])
+
+def get_moving_average(period, values):
+    values = torch.tensor(values, dtype=torch.float)
+    if len(values) >= period:
+        moving_avg = values.unfold(dimension=0, size=period, step=1) \
+            .mean(dim=1).flatten(start_dim=0)
+        moving_avg = torch.cat((torch.zeros(period-1), moving_avg))
+        return moving_avg.numpy()
+    else:
+        moving_avg = torch.zeros(len(values))
+        return moving_avg.numpy()
+    
+def LineOfSight_Check(D,H):
+    L=1
+    return L
+    c = 0.6 #urban 2GHz
+    d = 0.11 #urban 2GHz
+    RAND = random.uniform(0,1)
+    teta = math.atan(H/D) * 180/math.pi
+    if teta < 15:
+        return 2
+    p1 = c * ((teta - 15) ** d)
+    p2 = 1 - p1
+    if p1 >= p2:
+        if RAND >= p2:
+            L = 1
+        else:
+            L = 2
+    else:
+        if RAND >= p1:
+            L = 2
+        else:
+            L = 1
+    return L
+    
+def Average(lst): 
+    return sum(lst) / len(lst) 
+
+def extract_tensors(experiences):
+    # Convert batch of Experiences to Experience of batches
+    batch = Experience(*zip(*experiences))
+
+    t1 = torch.cat(batch.state)
+    t2 = torch.cat(batch.action)
+    t3 = torch.cat(batch.reward)
+    t4 = torch.cat(batch.next_state)
+
+    return (t1,t2,t3,t4)
+
+class Blob():
+    def __init__(self, size, USER1=False, USER2=False, USER3=False, USER4=False):
+        self.size = size
+        if USER1:
+            self.x = 20
+            self.y = 20
+        elif USER2:
+            self.x = 80
+            self.y = 80
+        elif USER3:
+            self.x = 20
+            self.y = 80
+        elif USER4:
+            self.x = 80
+            self.y = 20
+        else:
+            self.x = 50
+            self.y = 50
+
+    def __str__(self):
+        return f"Blob({self.x}, {self.y})"
+
+    def __sub__(self, other):
+        return [(self.x-other.x)/10, (self.y-other.y)/10]
+
+    def __eq__(self, other):
+        return self.x == other.x and self.y == other.y
+
+    def action(self, choice):
+        
+
+        if choice == 0:
+            self.move(x=1, y=1)
+            self.a1 += 0.05
+            self.a3 +=0.05
+            self.H += 1
+
+        elif choice == 1:
+            self.move(x=-1, y=-1)
+            self.a1 += 0.05
+            self.a3 +=0.05
+            self.H += 1
+
+        elif choice == 2:
+            self.move(x=-1, y=1)
+            self.a1 += 0.05
+            self.a3 +=0.05
+            self.H += 1
+
+        elif choice == 3:
+            self.move(x=1, y=-1)
+            self.a1 += 0.05
+            self.a3 +=0.05
+            self.H += 1
+            
+        elif choice == 4:
+            self.move(x=1, y=1)
+            self.a1 += 0.05
+            self.a3 -=0.05
+            self.H += 1
+
+        elif choice == 5:
+            self.move(x=-1, y=-1)
+            self.a1 += 0.05
+            self.a3 -= 0.05
+            self.H += 1
+
+        elif choice == 6:
+            self.move(x=-1, y=1)
+            self.a1 += 0.05
+            self.a3 -= 0.05
+            self.H += 1
+
+        elif choice == 7:
+            self.move(x=1, y=-1)
+            self.a1 += 0.05
+            self.a3 -= 0.05
+            self.H += 1
+            
+        elif choice == 8:
+            self.move(x=1, y=1)
+            self.a1 -= 0.05
+            self.a3 += 0.05
+            self.H += 1
+            
+        elif choice == 9:
+            self.move(x=-1, y=-1)
+            self.a1 -= 0.05
+            self.a3 += 0.05
+            self.H += 1
+
+        elif choice == 10:
+            self.a1 -= 0.05
+            self.a3 += 0.05
+            self.H += 1
+
+        elif choice == 11:
+            self.move(x=1, y=-1)
+            self.a1 -= 0.05
+            self.a3 += 0.05
+            self.H += 1
+            
+        elif choice == 12:
+            self.move(x=1, y=1)
+            self.a1 -= 0.05
+            self.a3 -= 0.05
+            self.H += 1
+
+        elif choice == 13:
+            self.move(x=-1, y=-1)
+            self.a1 -= 0.05
+            self.a3 -= 0.05
+            self.H += 1
+
+        elif choice == 14:
+            self.move(x=-1, y=1)
+            self.a1 -= 0.05
+            self.a3 -= 0.05
+            self.H += 1
+
+        elif choice == 15:
+            self.move(x=1, y=-1)
+            self.a1 -= 0.05
+            self.a3 -= 0.05
+            self.H += 1
+            
+        if choice == 16:
+            self.move(x=1, y=1)
+            self.a1 += 0.05
+            self.a3 +=0.05
+            self.H -= 1
+
+        elif choice == 17:
+            self.move(x=-1, y=-1)
+            self.a1 += 0.05
+            self.a3 +=0.05
+            self.H -= 1
+
+        elif choice == 18:
+            self.move(x=-1, y=1)
+            self.a1 += 0.05
+            self.a3 +=0.05
+            self.H -= 1
+
+        elif choice == 19:
+            self.move(x=1, y=-1)
+            self.a1 += 0.05
+            self.a3 +=0.05
+            self.H -= 1
+            
+        elif choice == 20:
+            self.move(x=1, y=1)
+            self.a1 += 0.05
+            self.a3 -=0.05
+            self.H -= 1
+
+        elif choice == 21:
+            self.move(x=-1, y=-1)
+            self.a1 += 0.05
+            self.a3 -= 0.05
+            self.H -= 1
+
+        elif choice == 22:
+            self.move(x=-1, y=1)
+            self.a1 += 0.05
+            self.a3 -= 0.05
+            self.H -= 1
+
+        elif choice == 23:
+            self.move(x=1, y=-1)
+            self.a1 += 0.05
+            self.a3 -= 0.05
+            self.H -= 1
+            
+        elif choice == 24:
+            self.move(x=1, y=1)
+            self.a1 -= 0.05
+            self.a3 += 0.05
+            self.H -= 1
+            
+        elif choice == 25:
+            self.move(x=-1, y=-1)
+            self.a1 -= 0.05
+            self.a3 += 0.05
+            self.H -= 1
+
+        elif choice == 26:
+            self.a1 -= 0.05
+            self.a3 += 0.05
+            self.H -= 1
+
+        elif choice == 27:
+            self.move(x=1, y=-1)
+            self.a1 -= 0.05
+            self.a3 += 0.05
+            self.H -= 1
+            
+        elif choice == 28:
+            self.move(x=1, y=1)
+            self.a1 -= 0.05
+            self.a3 -= 0.05
+            self.H -= 1
+
+        elif choice == 29:
+            self.move(x=-1, y=-1)
+            self.a1 -= 0.05
+            self.a3 -= 0.05
+            self.H -= 1
+
+        elif choice == 30:
+            self.move(x=-1, y=1)
+            self.a1 -= 0.05
+            self.a3 -= 0.05
+            self.H -= 1
+
+        elif choice == 31:
+            self.move(x=1, y=-1)
+            self.a1 -= 0.05
+            self.a3 -= 0.05
+            self.H -= 1
+            
+        if self.a1 > 1:
+            self.a1 = 1
+        elif self.a1 < 0:
+            self.a1 = 0
+        if self.a3 > 1:
+            self.a3 = 1
+        elif self.a3 < 0:
+            self.a3 = 0
+        if self.H <= 10:
+            self.H =10
+        
+
+    def move(self, x=False, y=False):
+
+        if not x:
+            self.x += np.random.randint(-1, 2)
+        else:
+            self.x += x
+
+        if not y:
+            self.y += np.random.randint(-1, 2)
+        else:
+            self.y += y
+
+        if self.x < 0:
+            self.x = 0
+        elif self.x > self.size-1:
+            self.x = self.size-1
+        if self.y < 0:
+            self.y = 0
+        elif self.y > self.size-1:
+            self.y = self.size-1
+
+class BlobEnv():
+    SIZE = 100
+    MOVE_PENALTY = 1
+    OBSERVATION_SPACE_VALUES = (SIZE, SIZE, 3)  # 4
+    UAV_N = 1  # UAV key in dict
+    USER_N = 2  # USER key in dict
+    UAV2_N = 4  # UAV2 key in dict
+    # the dict! (colors)
+    d = {1: (255, 175, 0),
+         2: (0, 255, 0),
+         3: (0, 0, 255),
+         4: (175, 0, 255)}
+
+    def reset(self):
+        P = 1 # Transmitted power 30dbm (i.e. 1w)
+        W = 5e7 # Bandwidth 50MHz
+        fc = 2e9 # Carrier frequency = 2GHz
+        N0 = 10e-17 # W/Hz
+        LOS_PL = 0.1
+        NLOS_PL = 20
+        N = N0 * W
+        c = 3e8
+        lamda = c/fc
+        self.UAV = Blob(self.SIZE)
+        self.UAV2 = Blob(self.SIZE)
+
+        self.h1 = []
+        self.h2 = []
+        self.h3 = []
+        self.h4 = []
+        self.a1 = []
+        self.a2 = []
+        self.a3 = []
+        self.a4 = []
+        self.SUM1 = []
+        self.SUM2 = []
+        self.SUM3 = []
+        self.SUM4 = []
+        self.Fairness = []
+        self.Hl = []
+        self.NLOS = []
+        self.NOMA = []
+        self.reward1 = []
+        self.reward2 = []
+        self.reward3 = []
+        self.reward4 = []
+        self.reward5 = []
+        self.reward6 = []
+        
+        self.UAV.a1 = 0.5
+        self.UAV.a2 = 0.5
+        self.UAV.a3 = 0.5
+        self.UAV.a4 = 0.5
+        self.UAV.H = 50   
+        H = self.UAV.H
+        H2 = 50
+
+        self.USER1 = Blob(self.SIZE, True, False, False, False)
+        self.USER2 = Blob(self.SIZE, False, True, False, False)
+        self.USER3 = Blob(self.SIZE, False, False, True, False)
+        self.USER4 = Blob(self.SIZE, False, False, False, True)
+
+        self.UAV2.x = int((self.USER1.x +self.USER2.x + self.USER3.x + self.USER4.x )/4)
+        self.UAV2.y = int((self.USER1.y +self.USER2.y + self.USER3.y + self.USER4.y )/4)
+
+        ob1 = self.UAV-self.USER1
+        ob2 = self.UAV-self.USER2
+        ob3 = self.UAV-self.USER3
+        ob4 = self.UAV-self.USER4
+        
+        D1 =  np.sum(np.sqrt([(10*ob1[0])**2, (10*ob1[1])**2]))
+        D2 = np.sum(np.sqrt([(10*ob2[0])**2, (10*ob2[1])**2]))
+        D3 = np.sum(np.sqrt([(10*ob3[0])**2, (10*ob3[1])**2]))
+        D4 = np.sum(np.sqrt([(10*ob4[0])**2, (10*ob4[1])**2]))
+
+        self.L1 = LineOfSight_Check(D1,H)
+        self.L2 = LineOfSight_Check(D2,H)
+        self.L3 = LineOfSight_Check(D3,H)
+        self.L4 = LineOfSight_Check(D4,H)
+        
+        Dt1 = np.sum(np.sqrt([ (10*ob1[0])**2, (10*ob1[1])**2, H**2  ]))
+        Dt2 = np.sum(np.sqrt([ (10*ob2[0])**2, (10*ob2[1])**2, H**2  ]))
+        Dt3 = np.sum(np.sqrt([ (10*ob3[0])**2, (10*ob3[1])**2, H**2  ]))
+        Dt4 = np.sum(np.sqrt([ (10*ob4[0])**2, (10*ob4[1])**2, H**2  ]))
+        
+        if self.L1 == 1:
+            h1 = 20*math.log10(Dt1) + 20*math.log10(fc) - 147.56 + LOS_PL
+        else:
+            h1 = 20*math.log10(Dt1) + 20*math.log10(fc) - 147.56 + NLOS_PL
+        if self.L2 == 1:
+            h2 = 20*math.log10(Dt2) + 20*math.log10(fc) - 147.56 + LOS_PL
+        else:
+            h2 = 20*math.log10(Dt2) + 20*math.log10(fc) - 147.56 + NLOS_PL
+        if self.L3 == 1:
+                	h3 = 20*math.log10(Dt3) + 20*math.log10(fc) - 147.56 + LOS_PL
+        else:
+                	h3 = 20*math.log10(Dt3) + 20*math.log10(fc) - 147.56 + NLOS_PL
+        if self.L4 == 1:
+                	h4 = 20*math.log10(Dt4) + 20*math.log10(fc) - 147.56 + LOS_PL
+        else:
+               	h4 = 20*math.log10(Dt4) + 20*math.log10(fc) - 147.56 + NLOS_PL
+            
+        h1 = -h1
+        h2 = -h2
+        h3 = -h3
+        h4 = -h4
+
+        h1 = 10 ** (h1/10)
+        h2 = 10 ** (h2/10)
+        h3 = 10 ** (h3/10)
+        h4 = 10 ** (h4/10)
+        
+        a1 =  self.UAV.a1
+        a2 =  1 - a1
+        a3 =  self.UAV.a3
+        a4 =  1 - a3
+
+        observation = [ob1[0]] + [ob1[1]] + [ob2[0]] + [ob2[1]]+ [ob3[0]] + [ob3[1]]+ [ob4[0]] + [ob4[1]] + [a1] + [a2] + [a3] + [a4] + [h1] + [h2] + [h3] + [h4] + [H]
+        
+        self.episode_step = 0
+
+        return observation
+
+    def step(self, action):
+        
+        done= False
+        
+        P = 1 # Transmitted power 30dbm (i.e. 1w)
+        W = 5e7 # Bandwidth 50MHz
+        fc = 2e9 # Carrier frequency = 2GHz
+        N0 = 10e-17 # W/Hz
+        LOS_PL = 0.1
+        NLOS_PL = 20
+        N = N0 * W
+        H = self.UAV.H # antenna Height
+        c = 3e8
+        lamda = c/fc  
+        
+        self.episode_step += 1
+        
+        ob1 = self.UAV-self.USER1
+        ob2 = self.UAV-self.USER2
+        ob3 = self.UAV-self.USER3
+        ob4 = self.UAV-self.USER4
+        
+        D1 =  np.sum(np.sqrt([(10*ob1[0])**2, (10*ob1[1])**2]))
+        D2 = np.sum(np.sqrt([(10*ob2[0])**2, (10*ob2[1])**2]))
+        D3 = np.sum(np.sqrt([(10*ob3[0])**2, (10*ob3[1])**2]))
+        D4 = np.sum(np.sqrt([(10*ob4[0])**2, (10*ob4[1])**2]))
+
+        self.L1 = LineOfSight_Check(D1,H)
+        self.L2 = LineOfSight_Check(D2,H)
+        self.L3 = LineOfSight_Check(D3,H)
+        self.L4 = LineOfSight_Check(D4,H)
+            
+        
+        Dt1 = np.sum(np.sqrt([ (10*ob1[0])**2, (10*ob1[1])**2, H**2  ]))
+        Dt2 = np.sum(np.sqrt([ (10*ob2[0])**2, (10*ob2[1])**2, H**2  ]))
+        Dt3 = np.sum(np.sqrt([ (10*ob3[0])**2, (10*ob3[1])**2, H**2  ]))
+        Dt4 = np.sum(np.sqrt([ (10*ob4[0])**2, (10*ob4[1])**2, H**2  ]))
+        
+        if self.L1 == 1:
+            h1 = 20*math.log10(Dt1) + 20*math.log10(fc) - 147.56 + LOS_PL
+        else:
+            h1 = 20*math.log10(Dt1) + 20*math.log10(fc) - 147.56 + NLOS_PL
+        if self.L2 == 1:
+            h2 = 20*math.log10(Dt2) + 20*math.log10(fc) - 147.56 + LOS_PL
+        else:
+            h2 = 20*math.log10(Dt2) + 20*math.log10(fc) - 147.56 + NLOS_PL
+        if self.L3 == 1:
+                	h3 = 20*math.log10(Dt3) + 20*math.log10(fc) - 147.56 + LOS_PL
+        else:
+                	h3 = 20*math.log10(Dt3) + 20*math.log10(fc) - 147.56 + NLOS_PL
+        if self.L4 == 1:
+                	h4 = 20*math.log10(Dt4) + 20*math.log10(fc) - 147.56 + LOS_PL
+        else:
+               	h4 = 20*math.log10(Dt4) + 20*math.log10(fc) - 147.56 + NLOS_PL
+            
+        h1 = -h1
+        h2 = -h2
+        h3 = -h3
+        h4 = -h4
+
+        h1 = 10 ** (h1/10)
+        h2 = 10 ** (h2/10)
+        h3 = 10 ** (h3/10)
+        h4 = 10 ** (h4/10)
+
+        
+        self.UAV.action(action)
+        
+        a1 =  self.UAV.a1
+        a2 =  1 - a1
+        a3 =  self.UAV.a3
+        a4 =  1 - a3
+        
+        self.h1.append(h1)
+        self.h2.append(h2)
+        self.h3.append(h3)
+        self.h4.append(h4)
+        self.a1.append(a1)
+        self.a2.append(a2)
+        self.a3.append(a3)
+        self.a4.append(a4)
+        self.Hl.append(H)
+
+        reward = 0
+        reward_1 = 0
+        reward_2 = 0
+        reward_4 = 0
+        reward_5 = 0
+        reward_6 = 0
+        
+        if h1 >= h2:
+            
+            SUM1 = math.log2(1 + h1 * a1 * P/N)
+            SUM2 = math.log2(1 + a2 * h2 * P / (a1 * h2 * P + N) )
+            reward_1 += SUM1
+            reward_2 += SUM2
+
+            if a2 > a1:
+              self.NOMA.append(1)
+              reward += 10
+            else:
+              self.NOMA.append(0)
+
+        else: 
+        
+            SUM1 = math.log2(1 + a1 * h1 * P / (a2 * h1 * P + N) )
+            SUM2 =  math.log2(1 + h2 * a2 * P/N)
+            reward_1 += SUM2
+            reward_2 += SUM1
+            if a1 > a2:
+                self.NOMA.append(1)
+                reward += 10
+            else:
+              self.NOMA.append(0)
+                
+        if h3 >= h4:
+            SUM3 = math.log2(1 + h3 * a3 * P/N)
+            SUM4 = math.log2(1 + a4 * h4 * P / (a3 * h4 * P + N) ) 
+            reward_4 += SUM3
+            reward_5 += SUM4
+            if a4 > a3:
+              self.NOMA.append(1)
+              reward += 10
+            else:
+              self.NOMA.append(0)
+            
+        else: 
+            
+            SUM3 = math.log2(1 + a3 * h3 * P / (a4 * h3 * P + N) )
+            SUM4 = math.log2(1 + h4 * a4 * P/N)
+            reward_4 += SUM4
+            reward_5 += SUM3  
+            if a3 > a4:
+                self.NOMA.append(1)
+                reward += 10
+            else:
+              self.NOMA.append(0)
+        
+        reward_3 = (SUM1 + SUM2 + SUM3 + SUM4)**2 / (4 * (SUM1**2 + SUM2**2 + SUM3**2 + SUM4**2))
+        self.Fairness.append(reward_3)
+        
+        reward_3 *= 0
+        reward_6 += 1e7 * (h1+h2+h3+h4)
+        reward +=  (reward_1 + reward_2 + reward_4 + reward_5)  + reward_3 + reward_6
+        
+        self.SUM1.append(SUM1)
+        self.SUM2.append(SUM2)
+        self.SUM3.append(SUM3)
+        self.SUM4.append(SUM4)
+        self.reward1.append(reward_1)
+        self.reward2.append(reward_2)
+        self.reward3.append(reward_3)
+        self.reward4.append(reward_4)
+        self.reward5.append(reward_5)
+        self.reward6.append(reward_6)
+
+        new_observation_m =  ([ob1[0]] + [ob1[1]] + [ob2[0]] + [ob2[1]]+ [ob3[0]] + [ob3[1]] + [ob4[0]] + [ob4[1]] + [a1] + [a2] + [a3] + [a4] + [h1] + [h2] + [h3] + [h4] + [H] )
+        new_observation =  new_observation_m  
+
+        if self.episode_step >= 300:
+            ob21 = self.UAV2-self.USER1
+            ob22 = self.UAV2-self.USER2
+            ob23 = self.UAV2-self.USER3
+            ob24 = self.UAV2-self.USER4
+            H2 = 50
+            
+            D21 =  np.sum(np.sqrt([(10*ob21[0])**2, (10*ob21[1])**2]))
+            D22 = np.sum(np.sqrt([(10*ob22[0])**2, (10*ob22[1])**2]))
+            D23 = np.sum(np.sqrt([(10*ob23[0])**2, (10*ob23[1])**2]))
+            D24 = np.sum(np.sqrt([(10*ob24[0])**2, (10*ob24[1])**2]))
+
+            Dt21 = np.sum(np.sqrt([ (10*ob21[0])**2, (10*ob21[1])**2, H2**2  ]))
+            Dt22 = np.sum(np.sqrt([ (10*ob22[0])**2, (10*ob22[1])**2, H2**2  ]))
+            Dt23 = np.sum(np.sqrt([ (10*ob23[0])**2, (10*ob23[1])**2, H2**2  ]))
+            Dt24 = np.sum(np.sqrt([ (10*ob24[0])**2, (10*ob24[1])**2, H2**2  ]))
+        
+            h221 = 20*math.log10(Dt21) + 20*math.log10(fc) - 147.56 + LOS_PL
+            h222 = 20*math.log10(Dt22) + 20*math.log10(fc) - 147.56 + LOS_PL
+            h223 = 20*math.log10(Dt23) + 20*math.log10(fc) - 147.56 + LOS_PL
+            h224 = 20*math.log10(Dt24) + 20*math.log10(fc) - 147.56 + LOS_PL
+            
+            h221 = -h221
+            h222 = -h222
+            h223 = -h223
+            h224 = -h224
+
+            h221 = 10 ** (h221/10)
+            h222 = 10 ** (h222/10)
+            h223 = 10 ** (h223/10)
+            h224 = 10 ** (h224/10)
+            
+            r = 0.5
+
+            if h221 >= h222:
+                a222 = ((2**r - 1)/2**r) * (1 + N/(P*h222))
+                a221 = 1 - a222
+                SUM221 = math.log2(1 + h221 * a221 * P/N)
+                SUM222 = math.log2(1 + a222 * h222 * P / (a221 * h222 * P + N) )
+            else: 
+                a221 = ((2**r - 1)/2**r) * (1 + N/(P*h221))
+                a222 = 1-a221
+                SUM221 = math.log2(1 + a221 * h221 * P / (a222 * h221 * P + N) )
+                SUM222 =  math.log2(1 + h222 * a222 * P/N)
+            if h223 >= h224:
+                a224 = ((2**r - 1)/2**r) * (1 + N/(P*h224))
+                a223 = 1 - a224
+                SUM223 = math.log2(1 + h223 * a223 * P/N)
+                SUM224 = math.log2(1 + a224 * h224 * P / (a223 * h224 * P + N) ) 
+            else: 
+                a223 = ((2**r - 1)/2**r) * (1 + N/(P*h223))
+                a224 = 1 - a223
+                SUM223 = math.log2(1 + a223 * h223 * P / (a224 * h223 * P + N) )
+                SUM224 = math.log2(1 + h224 * a224 * P/N)
+                
+            average_sum_rate2 =  SUM221 + SUM222 + SUM223 + SUM224  
+            Fairness222 = (SUM221 + SUM222 + SUM223 + SUM224)**2 / (4 * (SUM221**2 + SUM222**2 + SUM223**2 + SUM224**2))
+
+            h11.append(Average(self.h1))
+            h22.append(Average(self.h2)) 
+            h33.append(Average(self.h3)) 
+            h44.append(Average(self.h4)) 
+            a11.append(Average(self.a1)) 
+            a22.append(Average(self.a2)) 
+            a33.append(Average(self.a3)) 
+            a44.append(Average(self.a4)) 
+            SUM11.append(Average(self.SUM1)) 
+            SUM22.append(Average(self.SUM2)) 
+            SUM33.append(Average(self.SUM3)) 
+            SUM44.append(Average(self.SUM4))
+            reward1.append(Average(self.reward1))
+            reward2.append(Average(self.reward2))
+            reward3.append(Average(self.reward3))
+            reward4.append(Average(self.reward4))
+            reward5.append(Average(self.reward5))
+            reward6.append(Average(self.reward6))
+            average_episode_reward = episode_reward/self.episode_step 
+            Fairnessl.append(Average(self.Fairness))
+            episode_rewards.append(average_episode_reward)
+            episode_durations.append(timestep)
+            Height.append(Average(self.Hl))
+            AVG2.append(average_sum_rate2)
+            Fairnessl_2.append(Fairness222)
+
+            if (not episode % 50 and episode!=0) or episode == 999:
+              plot(episode_rewards,reward1,reward2,reward3,reward4,reward5,reward6,h11,h22,h33,h44,a11,a22,a33,a44,SUM11,SUM22,SUM33,SUM44,Fairnessl,AVG2, Fairnessl_2, Height, 100)
+            
+              average_h1 = 10 * math.log10(h11[-1])
+              average_h2 = 10 * math.log10(h22[-1])
+              average_h3 = 10 * math.log10(h33[-1])
+              average_h4 = 10 * math.log10(h44[-1])
+
+              average_h21 = math.log10(h221)
+              average_h22 = math.log10(h222)
+              average_h23 = math.log10(h223)
+              average_h24 = math.log10(h224)
+            
+              average_sum_rate = SUM11[-1] + SUM22[-1] + SUM33[-1] + SUM44[-1]
+            
+              print("\n                          UAV1                            ")
+              print("NOMA probability = ", round(np.sum(self.NOMA)/len(self.NOMA )*100,2 ), "%, lenght",len(self.NOMA))
+              print("NLOS probability = ", round(np.sum(self.NLOS)/len(self.NLOS )*100,2 ), "%")
+              print("h1: ",round(average_h1, 2),"dB, h2: ",round(average_h2, 2),"dB, h3: ",round(average_h3, 2),"dB, h4: ",round(average_h4, 2),"dB")
+              print("a1: ",round(a11[-1]*100, 2),"%, a2: ",round(a22[-1]*100, 2),"%, a3: ",round(a33[-1]*100, 2),"%, a4: ",round(a44[-1], 2)*100,"%")
+              print("SE1: ",round(SUM11[-1], 2),"Bits/s/Hz, SE2: ",round(SUM22[-1], 2),"Bits/s/Hz, SE3: ",round(SUM33[-1], 2),"Bits/s/Hz, SE4: ",round(SUM44[-1], 2),"Bits/s/Hz")
+              print("Total SE = ", round(average_sum_rate, 2), "Bits/s/Hz")
+              print("Total Sum Rate = ", round(50*average_sum_rate, 2), "Mbps")
+              print("Fairness = ", round(100*Fairnessl[-1],2), "%")
+              print("Height = ", round(Height[-1],2),"m")
+
+              print("\n                          UAV2                            ")
+              print("Fairness = ", round(Fairness222 *100,2), "%")
+              print("h1: ",round(average_h21, 2),"dB, h2: ",round(average_h22, 2),"dB, h3: ",round(average_h23, 2),"dB, h4: ",round(average_h24, 2),"dB")
+              print("a1: ",round(a221*100, 2),"%, a2: ",round(a222*100, 2),"%, a3: ",round(a223*100, 2),"%, a4: ",round(a224*100, 2),"%")
+              print("SE1: ",round(SUM221, 2),"Bits/s/Hz, SE2: ",round(SUM222, 2),"Bits/s/Hz, SE3: ",round(SUM223, 2),"Bits/s/Hz, SE4: ",round(SUM224, 2),"Bits/s/Hz")
+              print("Total SE = ", round(average_sum_rate2, 2), "Bits/s/Hz")
+              print("Total Sum Rate = ", round(50*average_sum_rate2, 2), "Mbps")
+              print("Height = ", round(H2,2),"m")
+            
+            done = True
+                          
+        return new_observation,new_observation_m, reward, done
+
+    def render(self):
+        img = self.get_image()
+        img = img.resize((500, 500)) # resizing
+        cv2.imshow("UAV Beta 0.95", np.array(img)) 
+        cv2.waitKey(1)
+
+    def get_image(self):
+        env = np.full((self.SIZE, self.SIZE, 3), 255, dtype=np.uint8)  # starts an rbg img
+        env[self.USER1.x][self.USER1.y] = self.d[(self.L1+1)]  
+        env[self.USER2.x][self.USER2.y] = self.d[(self.L2+1)]
+        env[self.USER3.x][self.USER3.y] = self.d[(self.L3+1)] 
+        env[self.USER4.x][self.USER4.y] = self.d[(self.L4+1)]
+        env[self.UAV.x][self.UAV.y] = self.d[self.UAV_N]
+        img = Image.fromarray(env, 'RGB')
+        return img 
+
+batch_size = 64
+gamma = 0.999
+eps_start = 1
+eps_end = 0.01
+eps_decay = 0.0001
+target_update = 10
+memory_size = 15000
+lr = 0.001
+num_episodes = 1000
+num_of_actions = 32
+num_of_arg_per_state = 17
+SHOW_PREVIEW = False
+AGGREGATE_STATS_EVERY = 10
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+em = BlobEnv()
+strategy = EpsilonGreedyStrategy(eps_start, eps_end, eps_decay)
+agent = Agent(strategy, num_of_actions, device)
+memory = ReplayMemory(memory_size)
+policy_net = DQN(num_of_arg_per_state).to(device)
+target_net = DQN(num_of_arg_per_state).to(device)
+target_net.load_state_dict(policy_net.state_dict())
+target_net.eval()
+optimizer = optim.Adam(params=policy_net.parameters(), lr=lr)
+
+episode_durations = []
+episode_rewards = []
+episode_wins = []
+h11 = []
+h22 = []
+h33 = []
+h44 = []
+a11 = []
+a22 = []
+a33 = []
+a44 = []
+SUM11 = []
+SUM22 = []
+SUM33 = []
+SUM44 = []
+TOTAL_SUM = []
+Fairnessl = []
+Height = []
+reward1 = []
+reward2 = []
+reward3 = []
+reward4 = []
+reward5 = []
+reward6 = []
+AVG2 = []
+Fairnessl_2 = []
+
+for episode in range(num_episodes):
+    state = torch.tensor([em.reset()], dtype=torch.float32).to(device)
+    episode_reward = 0
+    episode_win = 0
+
+    for timestep in count():   
+        action = agent.select_action(state, policy_net)
+        next_state, next_state_m, reward, done = em.step(action.item())
+        episode_reward += reward
+        reward = torch.tensor([reward], dtype=torch.int64).to(device)
+        next_state = torch.tensor([next_state], dtype=torch.float32).to(device)
+        next_state_m = torch.tensor([next_state_m], dtype=torch.float32).to(device)        
+        memory.push(Experience(state, action, next_state_m, reward))
+        state = next_state
+
+        if memory.can_provide_sample(batch_size):
+            experiences = memory.sample(batch_size)
+            states, actions, rewards, next_states = extract_tensors(experiences)
+            current_q_values = QValues.get_current(policy_net, states, actions)
+            next_q_values = QValues.get_next(target_net, next_states)
+            target_q_values = (next_q_values * gamma) + rewards
+            loss = F.mse_loss(current_q_values, target_q_values.unsqueeze(1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        if SHOW_PREVIEW and not episode % AGGREGATE_STATS_EVERY:
+            em.render()
+            
+        if done:         
+            break
+
+    if episode % target_update == 0:
+        target_net.load_state_dict(policy_net.state_dict())
+
